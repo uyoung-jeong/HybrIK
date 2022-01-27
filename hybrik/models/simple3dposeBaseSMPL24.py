@@ -260,12 +260,22 @@ class Simple3DPoseBaseSMPL24(nn.Module):
         hm_y = heatmaps.sum((2, 4))
         hm_z = heatmaps.sum((3, 4))
 
+        """
         hm_x = hm_x * torch.cuda.comm.broadcast(torch.arange(hm_x.shape[-1]).type(
             torch.cuda.FloatTensor), devices=[hm_x.device.index])[0]
         hm_y = hm_y * torch.cuda.comm.broadcast(torch.arange(hm_y.shape[-1]).type(
             torch.cuda.FloatTensor), devices=[hm_y.device.index])[0]
         hm_z = hm_z * torch.cuda.comm.broadcast(torch.arange(hm_z.shape[-1]).type(
             torch.cuda.FloatTensor), devices=[hm_z.device.index])[0]
+        """
+
+        hm_x = hm_x * torch.arange(hm_x.shape[-1]).type(
+            torch.cuda.FloatTensor).to(hm_x.device.index)
+        hm_y = hm_y * torch.arange(hm_y.shape[-1]).type(
+            torch.cuda.FloatTensor).to(hm_y.device.index)
+        hm_z = hm_z * torch.arange(hm_z.shape[-1]).type(
+            torch.cuda.FloatTensor).to(hm_z.device.index)
+
         coord_x = hm_x.sum(dim=2, keepdim=True)
         coord_y = hm_y.sum(dim=2, keepdim=True)
         coord_z = hm_z.sum(dim=2, keepdim=True)

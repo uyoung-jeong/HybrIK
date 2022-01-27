@@ -166,6 +166,9 @@ def validate_gt(m, opt, cfg, gt_val_dataset, heatmap_to_coord, batch_size=32, pr
                 'xyz_24': pred_xyz_jts_24_struct[i]
             }
 
+    if not os.path.exists('exp'):
+        os.makedirs('exp')
+        
     with open(os.path.join('exp', f'test_gt_kpt_rank_{opt.rank}.pkl'), 'wb') as fid:
         pk.dump(kpt_pred, fid, pk.HIGHEST_PROTOCOL)
 

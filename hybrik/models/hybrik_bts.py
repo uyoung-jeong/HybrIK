@@ -1,8 +1,8 @@
-# -----------------------------------------------------
+print# -----------------------------------------------------
 # Copyright (c) Shanghai Jiao Tong University. All rights reserved.
 # Written by Jiefeng Li (jeff.lee.sjtu@gmail.com)
 # -----------------------------------------------------
-
+# HybrIK + BTS
 from collections import namedtuple
 
 import numpy as np
@@ -13,7 +13,10 @@ from torch.nn import functional as F
 from .builder import SPPE
 from .layers.Resnet import ResNet
 from .layers.smpl.SMPL import SMPL_layer
-
+from .bts import encoder as bts_encoder
+from .bts import bts as bts_decoder
+from .bts import DepthParams
+from .layers.fusion_modules import PoseDepthFusion2D
 
 ModelOutput = namedtuple(
     typename='ModelOutput',
@@ -36,10 +39,12 @@ def norm_heatmap(norm_type, heatmap):
         raise NotImplementedError
 
 
+
+# Hybrik + BTS
 @SPPE.register_module
-class Simple3DPoseBaseSMPL24(nn.Module):
+class HybrikBTS(nn.Module):
     def __init__(self, norm_layer=nn.BatchNorm2d, **kwargs):
-        super(Simple3DPoseBaseSMPL24, self).__init__()
+        super(HybrikBTS, self).__init__()
         self.deconv_dim = kwargs['NUM_DECONV_FILTERS']
         self._norm_layer = norm_layer
         self.num_joints = 24
@@ -77,8 +82,7 @@ class Simple3DPoseBaseSMPL24(nn.Module):
         self.preact.load_state_dict(model_state)
 
         self.deconv_layers = self._make_deconv_layer()
-        self.final_layer = nn.Conv2d(
-            self.deconv_dim[2], self.num_joints * self.depth_dim, kernel_size=1, stride=1, padding=0)
+        #self.final_layer = nn.Conv2d(self.deconv_dim[2], self.num_joints * self.depth_dim, kernel_size=1, stride=1, padding=0)
 
         h36m_jregressor = np.load('./model_files/J_regressor_h36m.npy')
         self.smpl = SMPL_layer(
@@ -108,6 +112,24 @@ class Simple3DPoseBaseSMPL24(nn.Module):
         self.decphi = nn.Linear(1024, 23 * 2)  # [cos(phi), sin(phi)]
         self.decleaf = nn.Linear(1024, 5 * 4)  # rot_mat quat
 
+        # depth model
+        depth_params = DepthParams(max_depth=kwargs['DEPTH']['MAX_DEPTH'],dataset=kwargs['DEPTH']['DATASET'],encoder=kwargs['DEPTH']['ENCODER'])
+        self.depth_encoder = bts_encoder(depth_params)
+        self.depth_decoder = bts_decoder(depth_params, self.depth_encoder.feat_out_channels, kwargs['DEPTH']['BTS_SIZE'])
+
+        self.depth_input_adapter = None
+        self.depth_output_adapter = None
+
+        self.depth_in_channels = kwargs['FUSION']['DEPTH_IN_CHANNELS']
+        self.fusion_module = PoseDepthFusion2D(pose_in_channels=256,
+                           depth_in_channels=self.depth_in_channels,
+                           out_channels=self.num_joints * self.depth_dim,
+                           norm=kwargs['FUSION']['DEPTH_NORM'],
+                           fusion_method=kwargs['FUSION']['FUSION_METHOD'],
+                           concat_original_feature=kwargs['FUSION']['CONCAT_ORIGINAL_FEATURE'],
+                           concat_depth_feature=kwargs['FUSION']['CONCAT_DEPTH_FEATURE'])
+
+
     def _make_deconv_layer(self):
         deconv_layers = []
         deconv1 = nn.ConvTranspose2d(
@@ -132,6 +154,45 @@ class Simple3DPoseBaseSMPL24(nn.Module):
 
         return nn.Sequential(*deconv_layers)
 
+    def init_weights(self, cfg):
+        if cfg.MODEL.PRETRAINED:
+            print(f'Loading model from {cfg.MODEL.PRETRAINED}...')
+            self.load_state_dict(torch.load(cfg.MODEL.PRETRAINED))
+        elif cfg.MODEL.TRY_LOAD:
+            print(f'Loading model from {cfg.MODEL.TRY_LOAD}...')
+            pretrained_state = torch.load(cfg.MODEL.TRY_LOAD)
+            model_state = self.state_dict()
+            pretrained_state = {k: v for k, v in pretrained_state.items()
+                                if k in model_state and v.size() == model_state[k].size()}
+
+            model_state.update(pretrained_state)
+            self.load_state_dict(model_state)
+        else:
+            print('Create new model')
+            print('=> init weights')
+            self._initialize()
+
+            # separate loading if provided
+            if cfg.MODEL.HYBRIK_PRETRAINED:
+                print(f'Loading hybrik module from {cfg.MODEL.HYBRIK_PRETRAINED}...')
+                pretrained_state = torch.load(cfg.MODEL.HYBRIK_PRETRAINED)
+                model_state = self.state_dict()
+                pretrained_state = {k: v for k, v in pretrained_state.items()
+                                    if k in model_state and v.size() == model_state[k].size()}
+                print(f'update {len(pretrained_state)} items')
+                model_state.update(pretrained_state)
+                self.load_state_dict(model_state)
+
+            if cfg.MODEL.DEPTH.PRETRAINED:
+                print(f'Loading depth module from {cfg.MODEL.DEPTH.PRETRAINED}...')
+                pretrained_state = torch.load(cfg.MODEL.DEPTH.PRETRAINED)
+                model_state = self.state_dict()
+                pretrained_state = {k: v for k, v in pretrained_state.items()
+                                    if k in model_state and v.size() == model_state[k].size()}
+                print(f'update {len(pretrained_state)} items')
+                model_state.update(pretrained_state)
+                self.load_state_dict(model_state)
+
     def _initialize(self):
         for name, m in self.deconv_layers.named_modules():
             if isinstance(m, nn.ConvTranspose2d):
@@ -139,10 +200,30 @@ class Simple3DPoseBaseSMPL24(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-        for m in self.final_layer.modules():
+        for m in self.fusion_module.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.normal_(m.weight, std=0.001)
                 nn.init.constant_(m.bias, 0)
+
+    def freeze_weights(self, freeze_depth_enc=True, freeze_depth_dec=True):
+        print('Freezing weights')
+        if freeze_depth_enc:
+            for param in self.depth_encoder.parameters():
+                param.requires_grad = False
+
+        if freeze_depth_dec:
+            for param in self.depth_decoder.parameters():
+                param.requires_grad = False
+
+        # return trainable params
+        trainable_params = []
+        for name, p in self.named_parameters():
+            if freeze_depth_enc and 'depth_encoder.' in name:
+                continue
+            if freeze_depth_dec and 'depth_decoder.' in name:
+                continue
+            trainable_params.append(p)
+        return trainable_params
 
     def uvd_to_cam(self, uvd_jts, trans_inv, intrinsic_param, joint_root, depth_factor, return_relative=True):
         assert uvd_jts.dim() == 3 and uvd_jts.shape[2] == 3, uvd_jts.shape
@@ -239,9 +320,25 @@ class Simple3DPoseBaseSMPL24(nn.Module):
     def forward(self, x, trans_inv, intrinsic_param, joint_root, depth_factor, flip_item=None, flip_output=False):
         batch_size = x.shape[0]
 
+        # run depth module
+        focal = 518.8579 # nyu focal
+        # d_feat[0].shape: [32, 96, 128, 128]
+        # d_feat[1].shape: [32, 96, 64, 64]
+        # d_feat[2].shape: [32, 192, 32, 32]
+        # d_feat[3].shape: [32, 384, 16, 16]
+        # d_feat[4].shape: [32, 2208, 8, 8]
+        d_feat = self.depth_encoder(x)
+
+        # dec_d: 5 x [32, 1, 256, 256]
+        lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est = self.depth_decoder(d_feat, focal)
+
         x0 = self.preact(x) # [32, 512, 8, 8]
         out = self.deconv_layers(x0) # [32, 256, 64, 64]
-        out = self.final_layer(out) # [32, 1536, 64, 64]
+        #out = self.final_layer(out) # [32, 1536, 64, 64]
+
+        # fusion module
+        depth_f = depth_est
+        out = self.fusion_module(out, depth_f)
 
         out = out.reshape((out.shape[0], self.num_joints, -1))
         out = norm_heatmap(self.norm_type, out)

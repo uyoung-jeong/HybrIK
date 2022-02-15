@@ -94,6 +94,7 @@ class HP3D(data.Dataset):
         self._ann_file = os.path.join(
             root, f'annotation_mpi_inf_3dhp_{ann_file}.json')
         self._lazy_import = lazy_import
+        print(f'MPI-INF-3DHP lazy import is set to {lazy_import}')
         self._root = root
         self._skip_empty = skip_empty
         self._train = train

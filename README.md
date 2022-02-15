@@ -84,7 +84,7 @@ Download *Human3.6M*, *MPI-INF-3DHP*, *3DPW* and *MSCOCO* datasets. You need to 
 ## Train from scratch
 
 ``` bash
-./scripts/train_smpl.sh train_res34 ./configs/256x192_adam_lr1e-3-res34_smpl_3d_base_2x_mix.yaml
+./scripts/train_smpl.sh train_res34 ./configs/256x192_adam_lr1e-3-res34_smpl_24_3d_base_2x_mix_fixed.yaml
 ```
 
 ## Evaluation

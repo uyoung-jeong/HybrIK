@@ -197,8 +197,7 @@ def validate_gt(m, opt, cfg, gt_val_dataset, heatmap_to_coord, batch_size=32, pr
     with open(os.path.join(opt.work_dir, f'test_gt_kpt_rank_{opt.rank}.pkl'), 'wb') as fid:
         pk.dump(kpt_pred, fid, pk.HIGHEST_PROTOCOL)
 
-    if opt.distributed:
-        torch.distributed.barrier()  # Make sure all JSON files are saved
+    torch.distributed.barrier()  # Make sure all JSON files are saved
 
     if opt.rank == 0:
         kpt_all_pred = {}
@@ -235,18 +234,9 @@ def main():
     if opt.seed is not None:
         setup_seed(opt.seed)
 
-    if opt.launcher == 'slurm':
-        main_worker(None, opt, cfg)
-    elif opt.distributed:
-        ngpus_per_node = torch.cuda.device_count()
-        opt.ngpus_per_node = ngpus_per_node
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(opt, cfg))
-    else:
-        ngpus_per_node = 1
-        opt.ngpus_per_node = ngpus_per_node
-        main_worker(0, opt, cfg)
-
-
+    opt.ngpus_per_node = 1
+    opt.nThreads = 0
+    main_worker(0, opt, cfg)
 
 def main_worker(gpu, opt, cfg):
     if opt.seed is not None:
@@ -255,11 +245,7 @@ def main_worker(gpu, opt, cfg):
     if gpu is not None:
         opt.gpu = gpu
 
-    if opt.distributed:
-        init_dist(opt)
-    else:
-        opt.log = True
-        opt.world_size = 1
+    init_dist(opt)
 
     if not opt.log:
         logger.setLevel(50)
@@ -273,16 +259,9 @@ def main_worker(gpu, opt, cfg):
     logger.info('******************************')
 
     opt.nThreads = int(opt.nThreads / num_gpu)
-    print(f'{opt.nThreads} threads at {opt.rank} rank')
 
     # Model Initialize
     m = preset_model(cfg)
-
-    # freeze weights if needed
-    trainable_params = None
-    if hasattr(m, 'freeze_weights'):
-        trainable_params = m.freeze_weights()
-
     if opt.params:
         from thop import clever_format, profile
         input = torch.randn(1, 3, 256, 256).cuda(opt.gpu)
@@ -291,27 +270,16 @@ def main_worker(gpu, opt, cfg):
         logger.info(macs, params)
 
     m.cuda(opt.gpu)
-    if opt.distributed:
-        m = torch.nn.parallel.DistributedDataParallel(m, device_ids=[opt.gpu],find_unused_parameters=True)
-    else:
-        m = torch.nn.DataParallel(m, device_ids=[opt.gpu])
+    m = torch.nn.parallel.DistributedDataParallel(m, device_ids=[opt.gpu])
 
     criterion = builder.build_loss(cfg.LOSS).cuda(opt.gpu)
-
-    optimizer = None
-    if trainable_params is None:
-        optimizer = torch.optim.Adam(m.parameters(), lr=cfg.TRAIN.LR)
-    else:
-        optimizer = torch.optim.Adam(trainable_params, lr=cfg.TRAIN.LR)
+    optimizer = torch.optim.Adam(m.parameters(), lr=cfg.TRAIN.LR)
 
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg.TRAIN.LR_STEP, gamma=cfg.TRAIN.LR_FACTOR)
 
     if opt.log:
-        #tensorboard_logdir='tensorboard/{}/{}-{}'.format(cfg.DATASET.DATASET, cfg.FILE_NAME, opt.exp_id)
-        tensorboard_logdir='./exp/{}/{}-{}/tensorboard'.format(cfg.DATASET.DATASET, cfg.FILE_NAME, opt.exp_id)
-        print(f'tensorboard will be saved at {tensorboard_logdir}')
-        writer = SummaryWriter(tensorboard_logdir)
+        writer = SummaryWriter('.tensorboard/{}/{}-{}'.format(cfg.DATASET.DATASET, cfg.FILE_NAME, opt.exp_id))
     else:
         writer = None
 
@@ -324,13 +292,8 @@ def main_worker(gpu, opt, cfg):
 
     heatmap_to_coord = get_func_heatmap_to_coord(cfg)
 
-    train_sampler = None
-    if opt.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset, num_replicas=opt.world_size, rank=opt.rank)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(
-            train_dataset)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=opt.world_size, rank=opt.rank)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=cfg.TRAIN.BATCH_SIZE, shuffle=(train_sampler is None), num_workers=opt.nThreads, sampler=train_sampler, worker_init_fn=_init_fn)
 
@@ -347,13 +310,10 @@ def main_worker(gpu, opt, cfg):
     opt.trainIters = 0
     best_err_h36m = 999
     best_err_3dpw = 999
-    best_epoch_h36m = -1
-    best_epoch_3dpw = -1
 
     for i in range(cfg.TRAIN.BEGIN_EPOCH, cfg.TRAIN.END_EPOCH):
         opt.epoch = i
-        if opt.distributed:
-            train_sampler.set_epoch(i)
+        train_sampler.set_epoch(i)
 
         current_lr = optimizer.state_dict()['param_groups'][0]['lr']
 
@@ -363,10 +323,6 @@ def main_worker(gpu, opt, cfg):
         loss, acc17 = train(opt, train_loader, m, criterion, optimizer, writer)
         logger.epochInfo('Train', opt.epoch, loss, acc17)
 
-        if writer is not None:
-            writer.add_scalar('train/loss', loss, i)
-            writer.add_scalar('train/acc17', acc17, i)
-            writer.add_scalar('train/lr', current_lr, i)
         lr_scheduler.step()
 
         if (i + 1) % opt.snapshot == 0:
@@ -381,53 +337,36 @@ def main_worker(gpu, opt, cfg):
                     if gt_tot_err_h36m <= best_err_h36m:
                         best_err_h36m = gt_tot_err_h36m
                         torch.save(m.module.state_dict(), './exp/{}/{}-{}/best_h36m_model.pth'.format(cfg.DATASET.DATASET, cfg.FILE_NAME, opt.exp_id))
-                        best_epoch_h36m = i
                     if gt_tot_err_3dpw <= best_err_3dpw:
                         best_err_3dpw = gt_tot_err_3dpw
                         torch.save(m.module.state_dict(), './exp/{}/{}-{}/best_3dpw_model.pth'.format(cfg.DATASET.DATASET, cfg.FILE_NAME, opt.exp_id))
-                        best_epoch_3dpw = i
 
                     logger.info(f'##### Epoch {opt.epoch} | h36m err: {gt_tot_err_h36m} / {best_err_h36m} | 3dpw err: {gt_tot_err_3dpw} / {best_err_3dpw} #####')
 
-                if writer is not None:
-                    writer.add_scalar('val/h36m_err', gt_tot_err_h36m, i)
-                    writer.add_scalar('val/3dpw_err', gt_tot_err_3dpw, i)
-
-        if opt.distributed:
-            torch.distributed.barrier()  # Sync
+        torch.distributed.barrier()  # Sync
 
     torch.save(m.module.state_dict(), './exp/{}/{}-{}/final_DPG.pth'.format(cfg.DATASET.DATASET, cfg.FILE_NAME, opt.exp_id))
 
-    if opt.log and (writer is not None):
-        print(f'best 3dpw error: {best_err_3dpw}')
-        print(f'best h36m error: {best_err_h36m}')
-        writer.add_scalar('val/best_h36m_err', best_err_h36m, best_epoch_h36m)
-        writer.add_scalar('val/best_3dpw_err', best_err_3dpw, best_epoch_3dpw)
 
 def preset_model(cfg):
     model = builder.build_sppe(cfg.MODEL)
 
-    # model loading
-    model_class = str(model.__class__)
-    if 'HybrikBTS' in model_class:
-        model.init_weights(cfg)
+    if cfg.MODEL.PRETRAINED:
+        logger.info(f'Loading model from {cfg.MODEL.PRETRAINED}...')
+        model.load_state_dict(torch.load(cfg.MODEL.PRETRAINED))
+    elif cfg.MODEL.TRY_LOAD:
+        logger.info(f'Loading model from {cfg.MODEL.TRY_LOAD}...')
+        pretrained_state = torch.load(cfg.MODEL.TRY_LOAD)
+        model_state = model.state_dict()
+        pretrained_state = {k: v for k, v in pretrained_state.items()
+                            if k in model_state and v.size() == model_state[k].size()}
+
+        model_state.update(pretrained_state)
+        model.load_state_dict(model_state)
     else:
-        if cfg.MODEL.PRETRAINED:
-            logger.info(f'Loading model from {cfg.MODEL.PRETRAINED}...')
-            model.load_state_dict(torch.load(cfg.MODEL.PRETRAINED))
-        elif cfg.MODEL.TRY_LOAD:
-            logger.info(f'Loading model from {cfg.MODEL.TRY_LOAD}...')
-            pretrained_state = torch.load(cfg.MODEL.TRY_LOAD)
-            model_state = model.state_dict()
-            pretrained_state = {k: v for k, v in pretrained_state.items()
-                                if k in model_state and v.size() == model_state[k].size()}
-            print(f'update {len(pretrained_state)} items')
-            model_state.update(pretrained_state)
-            model.load_state_dict(model_state)
-        else:
-            logger.info('Create new model')
-            logger.info('=> init weights')
-            model._initialize()
+        logger.info('Create new model')
+        logger.info('=> init weights')
+        model._initialize()
 
     return model
 

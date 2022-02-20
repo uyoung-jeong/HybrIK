@@ -38,8 +38,6 @@ def norm_heatmap(norm_type, heatmap):
     else:
         raise NotImplementedError
 
-
-
 # Hybrik + BTS
 @SPPE.register_module
 class HybrikBTS(nn.Module):
@@ -114,13 +112,28 @@ class HybrikBTS(nn.Module):
 
         # depth model
         depth_params = DepthParams(max_depth=kwargs['DEPTH']['MAX_DEPTH'],dataset=kwargs['DEPTH']['DATASET'],encoder=kwargs['DEPTH']['ENCODER'])
+        self.depth_in_channels = kwargs['FUSION']['DEPTH_IN_CHANNELS']
+
+        self.depth_mask = []
+        for _ in range(5-self.depth_in_channels):
+            self.depth_mask.append(0)
+        for _ in range(self.depth_in_channels):
+            self.depth_mask.append(1)
+        self.depth_mask = torch.tensor(self.depth_mask, requires_grad=False).reshape(1,5,1,1)
+
         self.depth_encoder = bts_encoder(depth_params)
         self.depth_decoder = bts_decoder(depth_params, self.depth_encoder.feat_out_channels, kwargs['DEPTH']['BTS_SIZE'])
 
-        self.depth_input_adapter = None
-        self.depth_output_adapter = None
+        if kwargs['DEPTH']['ADAPTATION'] == 'conv1x1':
+            print('build depth adaptation layers')
+            self.depth_input_adapter = nn.Sequential(nn.Conv2d(3,3,kernel_size=1),
+                                                     nn.BatchNorm2d(3),
+                                                     nn.ReLU(inplace=True))
+            self.depth_output_adapter = nn.Sequential(nn.Conv2d(self.depth_in_channels,self.depth_in_channels,kernel_size=1))
+        else:
+            self.depth_input_adapter = None
+            self.depth_output_adapter = None
 
-        self.depth_in_channels = kwargs['FUSION']['DEPTH_IN_CHANNELS']
         self.fusion_module = PoseDepthFusion2D(pose_in_channels=256,
                            depth_in_channels=self.depth_in_channels,
                            out_channels=self.num_joints * self.depth_dim,
@@ -170,7 +183,7 @@ class HybrikBTS(nn.Module):
         else:
             print('Create new model')
             print('=> init weights')
-            self._initialize()
+            self._initialize(conv_init_method='normal_')
 
             # separate loading if provided
             if cfg.MODEL.HYBRIK_PRETRAINED:
@@ -193,17 +206,35 @@ class HybrikBTS(nn.Module):
                 model_state.update(pretrained_state)
                 self.load_state_dict(model_state)
 
-    def _initialize(self):
+    def _initialize(self,conv_init_method='normal_'):
+        conv_init = eval(f'nn.init.{conv_init_method}')
         for name, m in self.deconv_layers.named_modules():
             if isinstance(m, nn.ConvTranspose2d):
-                nn.init.normal_(m.weight, std=0.001)
+                if conv_init_method == 'normal_':
+                    conv_init(m.weight, std=0.001)
+                else:
+                    conv_init(m.weight)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-        for m in self.fusion_module.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.001)
-                nn.init.constant_(m.bias, 0)
+
+        modules = [self.fusion_module.modules()]
+        if self.depth_input_adapter is not None:
+            modules.append(self.depth_input_adapter.modules())
+        if self.depth_output_adapter is not None:
+            modules.append(self.depth_output_adapter.modules())
+
+        for module in modules:
+            for m in module:
+                if isinstance(m, nn.Conv2d):
+                    if conv_init_method == 'normal_':
+                        conv_init(m.weight, std=0.001)
+                    else:
+                        conv_init(m.weight)
+                    nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
 
     def freeze_weights(self, freeze_depth_enc=True, freeze_depth_dec=True):
         print('Freezing weights')
@@ -317,6 +348,7 @@ class HybrikBTS(nn.Module):
 
         return pred_leaf
 
+    # x.shape: [batch_size, 3, 256, 256]
     def forward(self, x, trans_inv, intrinsic_param, joint_root, depth_factor, flip_item=None, flip_output=False):
         batch_size = x.shape[0]
 
@@ -327,17 +359,28 @@ class HybrikBTS(nn.Module):
         # d_feat[2].shape: [32, 192, 32, 32]
         # d_feat[3].shape: [32, 384, 16, 16]
         # d_feat[4].shape: [32, 2208, 8, 8]
-        d_feat = self.depth_encoder(x)
+        x_depth = None
+        if self.depth_input_adapter is None:
+            x_depth = x
+        else:
+            x_depth = self.depth_input_adapter(x) # input adaptation
+        d_feat = self.depth_encoder(x_depth)
 
         # dec_d: 5 x [32, 1, 256, 256]
-        lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est = self.depth_decoder(d_feat, focal)
+        # lpg8x8, lpg4x4, lpg2x2, reduc1x1, depth_est
+        depth_outputs = self.depth_decoder(d_feat, focal)
+        depth_f = torch.cat(depth_outputs[-self.depth_in_channels:],1)
+
+        #depth_f = torch.mul(depth_f, self.depth_mask.to(depth_f.device)) # choose depth features by self.depth_in_channels
+
+        if self.depth_output_adapter is not None:
+            depth_f = self.depth_output_adapter(depth_f) # output adaptation
 
         x0 = self.preact(x) # [32, 512, 8, 8]
         out = self.deconv_layers(x0) # [32, 256, 64, 64]
         #out = self.final_layer(out) # [32, 1536, 64, 64]
 
         # fusion module
-        depth_f = depth_est
         out = self.fusion_module(out, depth_f)
 
         out = out.reshape((out.shape[0], self.num_joints, -1))

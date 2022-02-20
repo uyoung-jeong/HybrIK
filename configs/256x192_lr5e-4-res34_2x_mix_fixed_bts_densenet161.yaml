@@ -1,0 +1,90 @@
+DATASET:
+  DATASET: 'mix_smpl'
+  SET_LIST:
+    - ROOT: './data/h36m/'
+      TEST_SET: 'Sample_20_test_Human36M_smpl'
+      TRAIN_SET: 'Sample_5_train_Human36M_smpl_leaf_twist'
+    - ROOT: './data/coco/'
+      TRAIN_SET: 'train2017'
+    - ROOT: './data/3dhp/'
+      TRAIN_SET: 'train_v2_fix'
+  PROTOCOL: 2
+  FLIP: True
+  ROT_FACTOR: 30
+  SCALE_FACTOR: 0.3
+  NUM_JOINTS_HALF_BODY: 8
+  PROB_HALF_BODY: -1
+  COLOR_FACTOR: 0.2
+  OCCLUSION: True
+MODEL:
+  TYPE: 'HybrikBTS'
+  PRETRAINED: ''
+  TRY_LOAD: ''
+  HYBRIK_PRETRAINED: './pretrained/pretrained_res34.pth'
+  HYBRIK_TRY_LOAD: ''
+  IMAGE_SIZE:
+  - 256
+  - 256
+  HEATMAP_SIZE:
+  - 64
+  - 64
+  NUM_JOINTS: 24
+  NUM_DECONV_FILTERS:
+  - 256
+  - 256
+  - 256
+  NUM_LAYERS: 34
+  EXTRA:
+    SIGMA: 2
+    BACKBONE: 'resnet'
+    CROP: 'padding'
+    AUGMENT: 'none'
+    PRESET: 'simple_smpl_3d'
+    DEPTH_DIM: 64
+  POST:
+    NORM_TYPE: 'softmax'
+  DEPTH:
+    PRETRAINED: ''
+    TRY_LOAD: ''
+    BTS_SIZE: 512
+    ENCODER: 'densenet161_bts'
+    MAX_DEPTH: 10
+    DATASET: 'nyu'
+    ADAPTATION: ''
+  FUSION:
+    DEPTH_IN_CHANNELS: 1
+    DEPTH_NORM: 'softmax'
+    FUSION_METHOD: '2d_hadamard'
+    CONCAT_ORIGINAL_FEATURE: False
+    CONCAT_DEPTH_FEATURE: False
+LOSS:
+  TYPE: 'L1LossDimSMPL'
+  ELEMENTS:
+    BETA_WEIGHT: 1
+    BETA_REG_WEIGHT: 0
+    PHI_REG_WEIGHT: 0.0001
+    LEAF_REG_WEIGHT: 0
+    TWIST_WEIGHT: 0.01
+    THETA_WEIGHT: 0.01
+    UVD24_WEIGHT: 1
+    XYZ24_WEIGHT: 0
+    XYZ_SMPL24_WEIGHT: 0
+    XYZ_SMPL17_WEIGHT: 0
+    VERTICE_WEIGHT: 0
+TEST:
+  HEATMAP2COORD: 'coord'
+TRAIN:
+  WORLD_SIZE: 8
+  BATCH_SIZE: 16
+  BEGIN_EPOCH: 0
+  END_EPOCH: 40
+  OPTIMIZER: 'adam'
+  LR: 0.0005
+  LR_FACTOR: 0.2
+  LR_STEP:
+  - 20
+  - 90
+  DPG_MILESTONE: 140
+  DPG_STEP:
+  - 160
+  - 190
